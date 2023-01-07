@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"github.com/btcsuite/btcd/wire"
 	"time"
 
 	"github.com/btcsuite/btcutil"
@@ -24,15 +27,63 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	// Open a channel with 100k satoshis between Alice and Bob with Alice being
 	// the sole funder of the channel.
 	ctxt, _ := context.WithTimeout(ctxb, channelOpenTimeout)
-	chanAmt := btcutil.Amount(100000)
-	chanPoint := openChannelAndAssert(
+	aliceBobChanAmt := btcutil.Amount(100000)
+	aliceBobChanPoint := openChannelAndAssert(
 		ctxt, t, net, net.Alice, net.Bob,
 		lntest.OpenChannelParams{
-			Amt: chanAmt,
+			Amt: aliceBobChanAmt,
 		},
 	)
+	aliceBobChanTXID, err := lnrpc.GetChanPointFundingTxid(aliceBobChanPoint)
+	if err != nil {
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	aliceBobFundPoint := wire.OutPoint{
+		Hash:  *aliceBobChanTXID,
+		Index: aliceBobChanPoint.OutputIndex,
+	}
 
-	// Now that the channel is open, create an invoice for Bob which
+	// Create Carol, connect to Bob and open a 100k satoshis channel between Bob and Alice
+	carol, err := net.NewNode("Carol", nil)
+	if err != nil {
+		t.Fatalf("unable to create carol node: %v", err)
+	}
+	defer shutdownAndAssert(net, t, carol)
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	if err := net.ConnectNodes(ctxt, carol, net.Bob); err != nil {
+		t.Fatalf("unable to connect carol to bob: %v", err)
+	}
+	ctxt, _ = context.WithTimeout(ctxb, channelOpenTimeout)
+	bobCarolChanAmt := btcutil.Amount(100000)
+	bobCarolChanPoint := openChannelAndAssert(
+		ctxt, t, net, net.Bob, carol,
+		lntest.OpenChannelParams{
+			Amt: bobCarolChanAmt,
+		},
+	)
+	bobCarolChanTXID, err := lnrpc.GetChanPointFundingTxid(aliceBobChanPoint)
+	if err != nil {
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	bobCarolFundPoint := wire.OutPoint{
+		Hash:  *bobCarolChanTXID,
+		Index: bobCarolChanPoint.OutputIndex,
+	}
+
+	// Set Bob's channel fees to zero to simplify asserts
+	_, err = net.Bob.UpdateChannelPolicy(ctxb, &lnrpc.PolicyUpdateRequest{
+		Scope: &lnrpc.PolicyUpdateRequest_ChanPoint{
+			ChanPoint: bobCarolChanPoint,
+		},
+		BaseFeeMsat:   0,
+		FeeRate:       0,
+		TimeLockDelta: 20,
+	})
+	if err != nil {
+		t.Fatalf("unable to update bob channel fees: %v", err)
+	}
+
+	// Now that the channel is open, create an invoice for Carol which
 	// expects a payment of 1000 satoshis from Alice paid via a particular
 	// preimage.
 	const paymentAmt = 1000
@@ -42,26 +93,31 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 		RPreimage: preimage,
 		Value:     paymentAmt,
 	}
-	invoiceResp, err := net.Bob.AddInvoice(ctxb, invoice)
+	invoiceResp, err := carol.AddInvoice(ctxb, invoice)
 	if err != nil {
 		t.Fatalf("unable to add invoice: %v", err)
 	}
 
-	// Wait for Alice to recognize and advertise the new channel generated
+	// Wait for Alice to recognize and advertise the new channels generated
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	err = net.Alice.WaitForNetworkChannelOpen(ctxt, aliceBobChanPoint)
 	if err != nil {
 		t.Fatalf("alice didn't advertise channel before "+
 			"timeout: %v", err)
 	}
-	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	err = net.Bob.WaitForNetworkChannelOpen(ctxt, aliceBobChanPoint)
 	if err != nil {
 		t.Fatalf("bob didn't advertise channel before "+
 			"timeout: %v", err)
 	}
+	err = net.Alice.WaitForNetworkChannelOpen(ctxt, bobCarolChanPoint)
+	if err != nil {
+		t.Fatalf("alice didn't advertise bob-carol channel before "+
+			"timeout: %v", err)
+	}
 
-	// With the invoice for Bob added, send a payment towards Alice paying
+	// With the invoice for Carol added, send a payment from Alice paying
 	// to the above generated invoice.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	resp := sendAndAssertSuccess(
@@ -69,7 +125,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 		&routerrpc.SendPaymentRequest{
 			PaymentRequest: invoiceResp.PaymentRequest,
 			TimeoutSeconds: 60,
-			FeeLimitMsat:   noFeeLimitMsat,
+			FeeLimitMsat:   0,
 		},
 	)
 	if hex.EncodeToString(preimage) != resp.PaymentPreimage {
@@ -77,29 +133,33 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 			resp.PaymentPreimage)
 	}
 
-	// Bob's invoice should now be found and marked as settled.
+	// Carol's invoice should now be found and marked as settled.
 	payHash := &lnrpc.PaymentHash{
 		RHash: invoiceResp.RHash,
 	}
 	ctxt, _ = context.WithTimeout(ctxt, defaultTimeout)
-	dbInvoice, err := net.Bob.LookupInvoice(ctxt, payHash)
+	dbInvoice, err := carol.LookupInvoice(ctxt, payHash)
 	if err != nil {
 		t.Fatalf("unable to lookup invoice: %v", err)
 	}
 	if !dbInvoice.Settled { // nolint:staticcheck
-		t.Fatalf("bob's invoice should be marked as settled: %v",
+		t.Fatalf("invoice should be marked as settled: %v",
 			spew.Sdump(dbInvoice))
 	}
 
 	// With the payment completed all balance related stats should be
 	// properly updated.
 	err = wait.NoError(
-		assertAmountSent(paymentAmt, net.Alice, net.Bob),
+		assertAmountChannelSent(paymentAmt, aliceBobFundPoint, net.Alice, net.Bob),
 		3*time.Second,
 	)
 	if err != nil {
 		t.Fatalf(err.Error())
 	}
+	err = wait.NoError(
+		assertAmountChannelSent(paymentAmt, bobCarolFundPoint, net.Bob, carol),
+		3*time.Second,
+	)
 
 	// Create another invoice for Bob, this time leaving off the preimage
 	// to one will be randomly generated. We'll test the proper
@@ -127,9 +187,9 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	)
 
 	// The second payment should also have succeeded, with the balances
-	// being update accordingly.
+	// being updated accordingly.
 	err = wait.NoError(
-		assertAmountSent(2*paymentAmt, net.Alice, net.Bob),
+		assertAmountChannelSent(2*paymentAmt, aliceBobFundPoint, net.Alice, net.Bob),
 		3*time.Second,
 	)
 	if err != nil {
@@ -157,9 +217,9 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	)
 
 	// The keysend payment should also have succeeded, with the balances
-	// being update accordingly.
+	// being updated accordingly.
 	err = wait.NoError(
-		assertAmountSent(3*paymentAmt, net.Alice, net.Bob),
+		assertAmountChannelSent(3*paymentAmt, aliceBobFundPoint, net.Alice, net.Bob),
 		3*time.Second,
 	)
 	if err != nil {
@@ -244,5 +304,63 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	}
 
 	ctxt, _ = context.WithTimeout(ctxb, channelCloseTimeout)
-	closeChannelAndAssert(ctxt, t, net, net.Alice, chanPoint, false)
+	closeChannelAndAssert(ctxt, t, net, net.Alice, aliceBobChanPoint, false)
+	closeChannelAndAssert(ctxt, t, net, net.Bob, bobCarolChanPoint, false)
+}
+
+func assertAmountChannelSent(amt btcutil.Amount, chanPoint wire.OutPoint, sndr, rcvr *lntest.HarnessNode) func() error {
+	return func() error {
+		// Both channels should also have properly accounted from the
+		// amount that has been sent/received over the channel.
+		listReq := &lnrpc.ListChannelsRequest{}
+		ctxb := context.Background()
+		ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
+		sndrListChannels, err := sndr.ListChannels(ctxt, listReq)
+		if err != nil {
+			return fmt.Errorf("unable to query for %s's channel "+
+				"list: %v", sndr.Name(), err)
+		}
+		matchChanPoint := func(channel *lnrpc.Channel) bool {
+			return channel.ChannelPoint == chanPoint.String()
+		}
+
+		sndrChannel, err := first(sndrListChannels.Channels, matchChanPoint)
+		if err != nil {
+			return fmt.Errorf("no sender channel found with channel point %v", chanPoint)
+		}
+		sndrSatoshisSent := sndrChannel.TotalSatoshisSent
+		if sndrSatoshisSent != int64(amt) {
+			return fmt.Errorf("%s's satoshis sent is incorrect "+
+				"got %v, expected %v", sndr.Name(),
+				sndrSatoshisSent, amt)
+		}
+
+		ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+		rcvrListChannels, err := rcvr.ListChannels(ctxt, listReq)
+		if err != nil {
+			return fmt.Errorf("unable to query for %s's channel "+
+				"list: %v", rcvr.Name(), err)
+		}
+		rcvrChannel, err := first(rcvrListChannels.Channels, matchChanPoint)
+		if err != nil {
+			return fmt.Errorf("no receiver channel found with channel point %v", chanPoint)
+		}
+		rcvrSatoshisReceived := rcvrChannel.TotalSatoshisReceived
+		if rcvrSatoshisReceived != int64(amt) {
+			return fmt.Errorf("%s's satoshis received is "+
+				"incorrect got %v, expected %v", rcvr.Name(),
+				rcvrSatoshisReceived, amt)
+		}
+
+		return nil
+	}
+}
+
+func first(ss []*lnrpc.Channel, condition func(*lnrpc.Channel) bool) (*lnrpc.Channel, error) {
+	for _, s := range ss {
+		if condition(s) {
+			return s, nil
+		}
+	}
+	return &lnrpc.Channel{}, errors.New("no channel satisfies the condition")
 }
